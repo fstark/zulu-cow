@@ -21,12 +21,12 @@
  */
 // Constructor implementation
 ImageBackingStore::ImageBackingStore(const char *orig_filename, const char *dirty_filename,
-                                     uint32_t bitmap_size, uint32_t scsi_block_size)
+                                     uint32_t bitmap_size, uint32_t buffer_size, uint32_t scsi_block_size)
 {
-    m_iscopyonwrite = true;
     m_scsi_block_size = scsi_block_size;
     m_current_position = 0;
     m_bitmap_size = bitmap_size;
+    m_buffer_size = buffer_size;
 
     // Open files with default size for mock
     m_fsfile_orig.open(orig_filename, O_RDONLY);
@@ -47,8 +47,6 @@ ImageBackingStore::ImageBackingStore(const char *orig_filename, const char *dirt
 
     // Calculate group size - must be multiple of 512 sectors and fit within bitmap
     m_cow_group_size = ((total_sectors + max_groups - 1) / max_groups);
-    // Round up to nearest multiple of 512
-    m_cow_group_size = ((m_cow_group_size + 511) / 512) * 512;
 
     // Calculate actual number of groups needed
     m_cow_group_count = (total_sectors + m_cow_group_size - 1) / m_cow_group_size;
@@ -62,8 +60,15 @@ ImageBackingStore::ImageBackingStore(const char *orig_filename, const char *dirt
     memset(m_cow_bitmap, 0, bitmap_size);
 
     // Allocate temporary buffer for copy operations
-    m_temp_buffer = new uint8_t[kBufSize];
-    assert(m_temp_buffer != nullptr); // Check allocation succeeded
+    m_buffer = new uint8_t[m_buffer_size];
+    assert(m_buffer != nullptr); // Check allocation succeeded
+
+    std::cout << std::format( "Image size          {} bytes\n", image_size_bytes );
+    std::cout << std::format( "m_bitmap_size       {} bytes\n", m_bitmap_size );
+    std::cout << std::format( "m_cow_group_size    {} sectors\n", m_cow_group_size );
+    std::cout << std::format( "m_cow_group_count   {} groups\n", m_cow_group_count );
+    std::cout << std::format( "m_scsi_block_size   {} bytes\n", m_scsi_block_size );
+    std::cout << std::format( "m_buffer_size       {} bytes\n", m_buffer_size );
 }
 
 /**
@@ -135,9 +140,6 @@ ssize_t ImageBackingStore::cow_read(void *buf, size_t count)
 // Helper function implementation
 ImageBackingStore::eImageType ImageBackingStore::getImageType(uint32_t lba)
 {
-    if (!m_iscopyonwrite)
-        return IMG_TYPE_ORIG;
-
     uint32_t group = lba / m_cow_group_size;
     return getGroupImageType(group);
 }
@@ -155,9 +157,6 @@ ImageBackingStore::eImageType ImageBackingStore::getImageType(uint32_t lba)
  */
 void ImageBackingStore::setImageType(uint32_t lba, eImageType type)
 {
-    if (!m_iscopyonwrite)
-        return;
-
     uint32_t group = lba / m_cow_group_size;
     setGroupImageType(group, type);
 }
@@ -178,13 +177,7 @@ void ImageBackingStore::setImageType(uint32_t lba, eImageType type)
  */
 ImageBackingStore::eImageType ImageBackingStore::getGroupImageType(uint32_t group)
 {
-    if (!m_iscopyonwrite)
-        return IMG_TYPE_ORIG;
-
-    if (group >= m_cow_group_count)
-    {
-        return IMG_TYPE_ORIG; // Default type if out of range
-    }
+    assert(group < m_cow_group_count);
     return (m_cow_bitmap[group / 8] & (1 << (group % 8))) ? IMG_TYPE_DIRTY : IMG_TYPE_ORIG;
 }
 
@@ -205,13 +198,7 @@ ImageBackingStore::eImageType ImageBackingStore::getGroupImageType(uint32_t grou
  */
 void ImageBackingStore::setGroupImageType(uint32_t group, eImageType type)
 {
-    if (!m_iscopyonwrite)
-        return;
-
-    if (group >= m_cow_group_count)
-    {
-        return; // Out of range
-    }
+    assert(group < m_cow_group_count);
     if (type == IMG_TYPE_DIRTY)
     {
         m_cow_bitmap[group / 8] |= (1 << (group % 8));
@@ -314,10 +301,10 @@ void ImageBackingStore::performCopyOnWrite(uint32_t group)
 
     while (bytes_copied < group_size_bytes)
     {
-        uint32_t bytes_to_copy = std::min(kBufSize, group_size_bytes - bytes_copied);
+        uint32_t bytes_to_copy = std::min(m_buffer_size, group_size_bytes - bytes_copied);
 
-        m_fsfile_orig.read(m_temp_buffer, bytes_to_copy);
-        m_fsfile_dirty.write(m_temp_buffer, bytes_to_copy);
+        m_fsfile_orig.read(m_buffer, bytes_to_copy);
+        m_fsfile_dirty.write(m_buffer, bytes_to_copy);
 
         bytes_copied += bytes_to_copy;
     }

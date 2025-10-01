@@ -4,8 +4,8 @@
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
-#include <fcntl.h>  // For O_RDONLY, O_RDWR, O_CREAT
-#include <unistd.h> // For ssize_t
+#include <fcntl.h>
+#include <unistd.h>
 #include <cassert>
 
 /**
@@ -19,7 +19,7 @@ private:
     size_t m_position;
 
 public:
-    FsFile() : m_data(1024 * 1024), m_position(0) {}
+    FsFile() : m_data(8*1024*1024), m_position(0) {}
 
     /**
      * Open file with specified flags and optional size
@@ -69,50 +69,32 @@ public:
         return static_cast<ssize_t>(bytes_to_write);
     }
 
-    /**
-     * Seek to specified position
-     */
     void seek(size_t position)
     {
         m_position = std::min(position, m_data.size());
     }
 
-    /**
-     * Get current file position
-     */
     size_t position() const
     {
         return m_position;
     }
 
-    /**
-     * Get file size
-     */
     size_t size() const
     {
         return m_data.size();
     }
 
-    /**
-     * Get the underlying data for testing purposes
-     */
-    const std::vector<uint8_t> &data() const
+    std::vector<uint8_t> &data()
     {
         return m_data;
     }
 
-    /**
-     * Set data directly for testing purposes
-     */
     void set_data(const std::vector<uint8_t> &data)
     {
         m_data = data;
         m_position = 0;
     }
 
-    /**
-     * Resize the buffer (for testing purposes)
-     */
     void resize(size_t new_size)
     {
         m_data.resize(new_size, 0);
