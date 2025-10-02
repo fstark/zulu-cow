@@ -19,7 +19,7 @@ private:
     size_t m_position;
 
 public:
-    FsFile() : m_data(8*1024*1024), m_position(0) {}
+    FsFile() : m_data(8 * 1024 * 1024), m_position(0) {}
 
     /**
      * Open file with specified flags and optional size
