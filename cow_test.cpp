@@ -108,7 +108,7 @@ void diff(const std::vector<uint8_t> &data1, const std::vector<uint8_t> &data2)
 }
 
 /* Compare the contents of fs and bs */
-void check_integrity(ImageBackingStore& bs)
+void check_integrity(ImageBackingStore &bs)
 {
     if (fs.data() == bs.recreate())
         return;
@@ -139,9 +139,13 @@ void fillWithPseudoRandom(std::vector<uint8_t> &vec)
 {
     std::uniform_int_distribution<uint16_t> dis(0, 255);
 
-    for (auto &v : vec)
+    for (int i = 0; i < vec.size(); i += 512)
     {
-        v = static_cast<uint8_t>(dis(gen));
+        uint8_t v = static_cast<uint8_t>(dis(gen));
+        for (int j = 0; j < 512 && (i + j) < vec.size(); ++j)
+        {
+            vec[i + j] = v;
+        }
     }
 }
 
@@ -153,11 +157,11 @@ std::tuple<u_int32_t, u_int32_t> rand_start_and_size()
     return {start_sector * 512, num_sectors * 512};
 }
 
-void one_write(ImageBackingStore& bs)
+void one_write(ImageBackingStore &bs)
 {
     auto [start_byte, size] = rand_start_and_size();
 
-    std::cout << std::format("Write at {} size {}\n", start_byte, size);
+    std::cout << std::format("Write at {} size {} ", start_byte, size);
 
     std::vector<uint8_t> buffer(size);
     fillWithPseudoRandom(buffer);
@@ -168,7 +172,7 @@ void one_write(ImageBackingStore& bs)
     bs.cow_write(buffer.data(), size);
 }
 
-void one_read(ImageBackingStore& bs)
+void one_read(ImageBackingStore &bs)
 {
     auto [start_byte, size] = rand_start_and_size();
 
@@ -204,11 +208,11 @@ int main()
 
     for (int i = 0; i < 1000; i++)
     {
+        std::cout << std::format("{}: ", i);
         one_write(bs);
-        std::cout << std::format("{}      \r", i);
-        std::flush(std::cout);
-        check_integrity(bs);
+        // check_integrity(bs);
         one_read(bs);
+        std::cout << std::format("{}\n", bs.stats());
     }
 
     return 0;

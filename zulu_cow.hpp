@@ -24,16 +24,17 @@ private:
     uint32_t m_buffer_size;
 
     // Statistics counters
-    mutable uint64_t m_bytes_read_original = 0;   // Bytes read from original file
-    mutable uint64_t m_bytes_read_dirty = 0;      // Bytes read from dirty file
-    mutable uint64_t m_bytes_written_dirty = 0;   // Bytes written to dirty file
-    mutable uint64_t m_bytes_requested_read = 0;  // Bytes requested to be read by public methods
-    mutable uint64_t m_bytes_requested_write = 0; // Bytes requested to be written by public methods
+    mutable uint64_t m_bytes_read_original = 0;     // Bytes read from original file
+    mutable uint64_t m_bytes_read_dirty = 0;        // Bytes read from dirty file
+    mutable uint64_t m_bytes_written_dirty = 0;     // Bytes written to dirty file
+    mutable uint64_t m_bytes_requested_read = 0;    // Bytes requested to be read by public methods
+    mutable uint64_t m_bytes_requested_write = 0;   // Bytes requested to be written by public methods
+    mutable uint64_t m_bytes_read_original_cow = 0; // Bytes read from original file due to COW operations
 
 public:
     // Constructor for copy-on-write setup
     ImageBackingStore(const char *orig_filename, const char *dirty_filename,
-                      uint32_t bitmap_size = 1024, uint32_t buffer_size = 2048, uint32_t scsi_block_size = 512);
+                      uint32_t bitmap_size = 22000, uint32_t buffer_size = 2048, uint32_t scsi_block_size = 512);
 
     // Destructor to clean up allocated memory
     ~ImageBackingStore();
@@ -76,9 +77,10 @@ public:
 
     // Statistics
     void dumpstats() const;
+    std::string stats() const;
 
 protected:
-    ssize_t cow_read_single(uint32_t from, uint32_t to, void *buf);
+    ssize_t cow_read_single(uint32_t from, uint32_t count, void *buf);
 
     ssize_t cow_read(uint32_t from, uint32_t to, void *buf);
 

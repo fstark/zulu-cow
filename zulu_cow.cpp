@@ -5,13 +5,23 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+/*
+
+|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|----- Sectors (512 bytes each)
+                  |                          |                          |                          |      Groups (3 sectors each)
+  CLEAN           |          CLEAN           |          CLEAN           |          CLEAN           |      Group state before write
+                  |                  [---------------------------------------------------]         |      Write 6 blocs, spanning 3 groups
+                  |[ COPY...COPY...] [ WRITE...WRITE...WRITE...WRITE...WRITE...WRITE...  ] [ COPY ]|      Actions taken
+  CLEAN           |          DIRTY           |          DIRTY           |          DIRTY           |      Group state after write
+|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|----- Sectors (512 bytes each)
+*/
+
 // Initializes copy-on-write store: bitmap_size (dirty tracking), buffer_size (I/O chunks), scsi_block_size (sector size)
 ImageBackingStore::ImageBackingStore(const char *orig_filename, const char *dirty_filename,
-                                     uint32_t bitmap_size, uint32_t buffer_size, uint32_t scsi_block_size)
+                                     uint32_t bitmap_max_size, uint32_t buffer_size, uint32_t scsi_block_size)
 {
     m_scsi_block_size = scsi_block_size;
     m_current_position = 0;
-    m_bitmap_size = bitmap_size;
     m_buffer_size = buffer_size;
 
     // Open files with default size for mock
@@ -29,7 +39,7 @@ ImageBackingStore::ImageBackingStore(const char *orig_filename, const char *dirt
 
     // Calculate optimal group size based on provided bitmap size
     // We have bitmap_size * 8 bits available in our bitmap
-    uint32_t max_groups = bitmap_size * 8;
+    uint32_t max_groups = bitmap_max_size * 8;
 
     // Calculate group size - must be multiple of 512 sectors and fit within bitmap
     m_cow_group_size = ((total_sectors + max_groups - 1) / max_groups);
@@ -41,17 +51,19 @@ ImageBackingStore::ImageBackingStore(const char *orig_filename, const char *dirt
     // This should never happen due to our group size calculation
     assert(m_cow_group_count <= max_groups);
 
+    m_bitmap_size = (m_cow_group_count + 7) / 8;
+
     // Allocate and initialize bitmap using the provided bitmap_size
-    m_cow_bitmap = new uint8_t[bitmap_size];
+    m_cow_bitmap = new uint8_t[m_bitmap_size];
     assert(m_cow_bitmap != nullptr); // Check allocation succeeded
-    memset(m_cow_bitmap, 0, bitmap_size);
+    memset(m_cow_bitmap, 0, m_bitmap_size);
 
     // Allocate temporary buffer for copy operations
     m_buffer = new uint8_t[m_buffer_size];
     assert(m_buffer != nullptr); // Check allocation succeeded
 
     std::cout << std::format("Image size          {} bytes\n", image_size_bytes);
-    std::cout << std::format("m_bitmap_size       {} bytes, #groups = {}\n", m_bitmap_size, m_cow_group_count);
+    std::cout << std::format("m_bitmap_size       #groups = {}, real size = {} (requested: {})\n", m_cow_group_count, m_bitmap_size, bitmap_max_size);
     std::cout << std::format("m_cow_group_size    {} sectors ({} bytes)\n", m_cow_group_size, m_cow_group_size_bytes);
     std::cout << std::format("m_scsi_block_size   {} bytes\n", m_scsi_block_size);
     std::cout << std::format("m_buffer_size       {} bytes\n", m_buffer_size);
@@ -65,15 +77,32 @@ ImageBackingStore::~ImageBackingStore()
     delete[] m_buffer;
 }
 
+std::string ImageBackingStore::stats() const
+{
+    double over_read = 0;
+    double over_write = 0;
+    if (m_bytes_requested_read > 0)
+    {
+        over_read = 100.0 * (static_cast<double>(m_bytes_read_original + m_bytes_read_dirty) / m_bytes_requested_read - 1);
+    }
+    if (m_bytes_requested_write > 0)
+    {
+        over_write = 100.0 * (static_cast<double>(m_bytes_read_original_cow + m_bytes_written_dirty) / m_bytes_requested_write - 1);
+    }
+
+    return std::format("Over-read: {:.2f}%, Over-write: {:.2f}%", over_read, over_write);
+}
+
 // Dumps detailed I/O statistics
 void ImageBackingStore::dumpstats() const
 {
     std::cout << std::format("=== I/O Statistics ===\n");
     std::cout << std::format("Bytes requested to read:  {}\n", m_bytes_requested_read);
-    std::cout << std::format("Bytes requested to write: {}\n", m_bytes_requested_write);
-    std::cout << std::format("Bytes read from original: {}\n", m_bytes_read_original);
     std::cout << std::format("Bytes read from dirty:    {}\n", m_bytes_read_dirty);
+    std::cout << std::format("Bytes read from original: {}\n", m_bytes_read_original);
+    std::cout << std::format("Bytes requested to write: {}\n", m_bytes_requested_write);
     std::cout << std::format("Bytes written to dirty:   {}\n", m_bytes_written_dirty);
+    std::cout << std::format("Bytes read from original COW: {}\n", m_bytes_read_original_cow);
     std::cout << std::format("======================\n");
 
     if (m_bytes_requested_read > 0)
@@ -83,7 +112,7 @@ void ImageBackingStore::dumpstats() const
     }
     if (m_bytes_requested_write > 0)
     {
-        double over_write = 100.0 * (static_cast<double>(m_bytes_written_dirty) / m_bytes_requested_write - 1);
+        double over_write = 100.0 * (static_cast<double>(m_bytes_read_original_cow + m_bytes_written_dirty) / m_bytes_requested_write - 1);
         std::cout << std::format(" Over-write : {:.2f}%\n", over_write);
     }
 }
@@ -110,35 +139,20 @@ void ImageBackingStore::setGroupImageType(uint32_t group, eImageType type)
 }
 
 // Reads from a single image type (original or dirty) for given byte range
-ssize_t ImageBackingStore::cow_read_single(uint32_t from, uint32_t to, void *buf)
+// Only used as a backend of the high-level read
+ssize_t ImageBackingStore::cow_read_single(uint32_t from, uint32_t count, void *buf)
 {
-    uint32_t from_group = groupFromOffset(from);
-
-    eImageType type = getGroupImageType(from_group);
-    size_t count = to - from;
-
-    ssize_t bytes_read;
-    if (type == IMG_TYPE_DIRTY)
+    if (getGroupImageType(groupFromOffset(from)) == IMG_TYPE_DIRTY)
     {
         // Read from overlay/dirty file at same offset as original
+        m_bytes_read_dirty += count;
         m_fsfile_dirty.seek(from);
-        bytes_read = m_fsfile_dirty.read(buf, count);
-        if (bytes_read > 0)
-        {
-            m_bytes_read_dirty += bytes_read;
-        }
+        return m_fsfile_dirty.read(buf, count);
     }
-    else
-    {
-        // Read from original file
-        m_fsfile_orig.seek(from);
-        bytes_read = m_fsfile_orig.read(buf, count);
-        if (bytes_read > 0)
-        {
-            m_bytes_read_original += bytes_read;
-        }
-    }
-    return bytes_read;
+    // Read from original file
+    m_bytes_read_original += count;
+    m_fsfile_orig.seek(from);
+    return m_fsfile_orig.read(buf, count);
 }
 
 // Reads across multiple groups, switching between original and dirty files as needed
@@ -164,7 +178,7 @@ ssize_t ImageBackingStore::cow_read(uint32_t from, uint32_t to, void *buf)
         }
 
         // Read this chunk using cow_read_single
-        ssize_t bytes_read = cow_read_single(current_offset, chunk_end, buffer_ptr);
+        ssize_t bytes_read = cow_read_single(current_offset, chunk_end - current_offset, buffer_ptr);
         if (bytes_read <= 0)
             break;
 
@@ -195,20 +209,10 @@ ssize_t ImageBackingStore::cow_read(void *buf, size_t count)
     return bytes_read;
 }
 
-// Copy-on-write implementation: writes data and preserves unmodified portions at begining and end
+// Copy-on-write implementation: writes data and including potentially unmodified portions at begining and end
 ssize_t ImageBackingStore::cow_write(uint32_t from, uint32_t to, const void *buf)
 {
     size_t count = to - from;
-
-    // First, blast all the data into the dirty file
-    m_fsfile_dirty.seek(from);
-    ssize_t bytes_written = m_fsfile_dirty.write(buf, count);
-    if (bytes_written <= 0)
-    {
-        return bytes_written;
-    }
-
-    m_bytes_written_dirty += bytes_written;
 
     uint32_t first_group = groupFromOffset(from);
     uint32_t last_group = groupFromOffset(to - 1); // Last byte affected
@@ -223,6 +227,16 @@ ssize_t ImageBackingStore::cow_write(uint32_t from, uint32_t to, const void *buf
             performCopyOnWrite(group_start, from);
         }
     }
+
+    // Handle copy in the dirty file
+    m_fsfile_dirty.seek(from);
+    ssize_t bytes_written = m_fsfile_dirty.write(buf, count);
+    if (bytes_written <= 0)
+    {
+        return bytes_written;
+    }
+
+    m_bytes_written_dirty += count;
 
     // Handle last group - copy-on-write if needed and write doesn't end at group end
     if (getGroupImageType(last_group) == IMG_TYPE_ORIG)
@@ -280,17 +294,11 @@ void ImageBackingStore::performCopyOnWrite(uint32_t from_offset, uint32_t to_off
     {
         uint32_t chunk_size = std::min(m_buffer_size, bytes_to_copy - bytes_copied);
 
-        ssize_t bytes_read = m_fsfile_orig.read(m_buffer, chunk_size);
-        ssize_t bytes_written = m_fsfile_dirty.write(m_buffer, chunk_size);
+        m_fsfile_orig.read(m_buffer, chunk_size);
+        m_bytes_read_original_cow += chunk_size;
 
-        if (bytes_read > 0)
-        {
-            m_bytes_read_original += bytes_read;
-        }
-        if (bytes_written > 0)
-        {
-            m_bytes_written_dirty += bytes_written;
-        }
+        m_fsfile_dirty.write(m_buffer, chunk_size);
+        m_bytes_written_dirty += chunk_size;
 
         bytes_copied += chunk_size;
     }
