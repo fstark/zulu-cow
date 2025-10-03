@@ -206,13 +206,18 @@ int main()
 
     check_integrity(bs);
 
-    for (int i = 0; i < 1000; i++)
+    for (int i = 0; i < 100000; i++)
     {
         std::cout << std::format("{}: ", i);
         one_write(bs);
         // check_integrity(bs);
         one_read(bs);
         std::cout << std::format("{}\n", bs.stats());
+        if (i % 100 == 0)
+        {
+            bs.dumpstats();
+            bs.resetStats();
+        }
     }
 
     return 0;

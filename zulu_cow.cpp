@@ -5,17 +5,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-/*
-
-|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|----- Sectors (512 bytes each)
-                  |                          |                          |                          |      Groups (3 sectors each)
-  CLEAN           |          CLEAN           |          CLEAN           |          CLEAN           |      Group state before write
-                  |                  [---------------------------------------------------]         |      Write 6 blocs, spanning 3 groups
-                  |[ COPY...COPY...] [ WRITE...WRITE...WRITE...WRITE...WRITE...WRITE...  ] [ COPY ]|      Actions taken
-  CLEAN           |          DIRTY           |          DIRTY           |          DIRTY           |      Group state after write
-|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|----- Sectors (512 bytes each)
-*/
-
 // Initializes copy-on-write store: bitmap_size (dirty tracking), buffer_size (I/O chunks), scsi_block_size (sector size)
 ImageBackingStore::ImageBackingStore(const char *orig_filename, const char *dirty_filename,
                                      uint32_t bitmap_max_size, uint32_t buffer_size, uint32_t scsi_block_size)
@@ -67,6 +56,8 @@ ImageBackingStore::ImageBackingStore(const char *orig_filename, const char *dirt
     std::cout << std::format("m_cow_group_size    {} sectors ({} bytes)\n", m_cow_group_size, m_cow_group_size_bytes);
     std::cout << std::format("m_scsi_block_size   {} bytes\n", m_scsi_block_size);
     std::cout << std::format("m_buffer_size       {} bytes\n", m_buffer_size);
+
+    resetStats();
 }
 
 // Destructor: cleans up allocated memory
@@ -139,7 +130,7 @@ void ImageBackingStore::setGroupImageType(uint32_t group, eImageType type)
 }
 
 // Reads from a single image type (original or dirty) for given byte range
-// Only used as a backend of the high-level read
+// Used for implementation the high-level read
 ssize_t ImageBackingStore::cow_read_single(uint32_t from, uint32_t count, void *buf)
 {
     if (getGroupImageType(groupFromOffset(from)) == IMG_TYPE_DIRTY)
@@ -155,7 +146,19 @@ ssize_t ImageBackingStore::cow_read_single(uint32_t from, uint32_t count, void *
     return m_fsfile_orig.read(buf, count);
 }
 
-// Reads across multiple groups, switching between original and dirty files as needed
+/*
+    Reads across multiple groups, switching between original and dirty files as needed
+
+|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|----- Sectors (512 bytes each)
+                           |                          |                          |                          |      Groups (3 sectors each)
+           DIRTY           |          CLEAN           |          CLEAN           |          DIRTY           |      Group state before write
+          [---------------------------------------------------------------------------------------]         |      Read 10 blocs, spanning 4 groups
+          [  DIRTY READ   ] [                      CLEAN READ                   ] [  DIRTY READ   ]|        |      Underlying chunks from alternating sources
+|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|----- Sectors (512 bytes each)
+
+    Idea is we repeatedly create a "chunk" that extends from the current read position
+    to the next transition between original and dirty, or to the end of the read request
+*/
 ssize_t ImageBackingStore::cow_read(uint32_t from, uint32_t to, void *buf)
 {
     ssize_t total_bytes_read = 0;
@@ -209,7 +212,51 @@ ssize_t ImageBackingStore::cow_read(void *buf, size_t count)
     return bytes_read;
 }
 
-// Copy-on-write implementation: writes data and including potentially unmodified portions at begining and end
+//  Helper function for cow_write
+//  Copies original data to overlay (dirty) file for a specific byte range
+//  Request never spans multiple groups
+void ImageBackingStore::performCopyOnWrite(uint32_t from_offset, uint32_t to_offset)
+{
+    // Verify both offsets are in the same group
+    assert(groupFromOffset(from_offset) == groupFromOffset(to_offset - 1));
+
+    uint32_t bytes_to_copy = to_offset - from_offset;
+    uint32_t bytes_copied = 0;
+
+    m_fsfile_orig.seek(from_offset);
+    m_fsfile_dirty.seek(from_offset);
+
+    while (bytes_copied < bytes_to_copy)
+    {
+        uint32_t chunk_size = std::min(m_buffer_size, bytes_to_copy - bytes_copied);
+
+        m_fsfile_orig.read(m_buffer, chunk_size);
+        m_bytes_read_original_cow += chunk_size;
+
+        m_fsfile_dirty.write(m_buffer, chunk_size);
+        m_bytes_written_dirty += chunk_size;
+
+        bytes_copied += chunk_size;
+    }
+}
+
+/*
+    Writes data performing copy-on-write for unmodified portions at begining and end
+
+|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|----- Sectors (512 bytes each)
+                  |                          |                          |                          |      Groups (3 sectors each)
+  CLEAN           |          CLEAN           |          CLEAN           |          CLEAN           |      Group state before write
+                  |                  [---------------------------------------------------]         |      Write 6 blocs, spanning 3 groups
+                  |[ COPY...COPY...] [ WRITE...WRITE...WRITE...WRITE...WRITE...WRITE...  ] [ COPY ]|      Actions taken (1), (2), (3)
+  CLEAN           |          DIRTY           |          DIRTY           |          DIRTY           |      Group market dirty after write (4)
+|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|----- Sectors (512 bytes each)
+
+    Implementation follows the above pattern:
+    - (1) Handle first group: if clean and write doesn't start at group beginning, copy original data
+    - (2) Write the main data to dirty file
+    - (3) Handle last group: if clean and write doesn't end at group end, copy original data
+    - (4) Mark all affected groups as dirty
+*/
 ssize_t ImageBackingStore::cow_write(uint32_t from, uint32_t to, const void *buf)
 {
     size_t count = to - from;
@@ -259,7 +306,6 @@ ssize_t ImageBackingStore::cow_write(uint32_t from, uint32_t to, const void *buf
 }
 
 // Wrapper for cow_write that uses current file position and updates it
-// Wrapper for cow_write that uses current file position and updates it
 ssize_t ImageBackingStore::cow_write(const void *buf, size_t count)
 {
     m_bytes_requested_write += count;
@@ -276,30 +322,4 @@ ssize_t ImageBackingStore::cow_write(const void *buf, size_t count)
     }
 
     return bytes_written;
-}
-
-// Copies original data to overlay file for a specific byte range within a group
-void ImageBackingStore::performCopyOnWrite(uint32_t from_offset, uint32_t to_offset)
-{
-    // Verify both offsets are in the same group
-    assert(groupFromOffset(from_offset) == groupFromOffset(to_offset - 1));
-
-    uint32_t bytes_to_copy = to_offset - from_offset;
-    uint32_t bytes_copied = 0;
-
-    m_fsfile_orig.seek(from_offset);
-    m_fsfile_dirty.seek(from_offset);
-
-    while (bytes_copied < bytes_to_copy)
-    {
-        uint32_t chunk_size = std::min(m_buffer_size, bytes_to_copy - bytes_copied);
-
-        m_fsfile_orig.read(m_buffer, chunk_size);
-        m_bytes_read_original_cow += chunk_size;
-
-        m_fsfile_dirty.write(m_buffer, chunk_size);
-        m_bytes_written_dirty += chunk_size;
-
-        bytes_copied += chunk_size;
-    }
 }

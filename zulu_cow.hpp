@@ -34,7 +34,7 @@ private:
 public:
     // Constructor for copy-on-write setup
     ImageBackingStore(const char *orig_filename, const char *dirty_filename,
-                      uint32_t bitmap_size = 22000, uint32_t buffer_size = 2048, uint32_t scsi_block_size = 512);
+                      uint32_t bitmap_size = 1024, uint32_t buffer_size = 2048, uint32_t scsi_block_size = 512);
 
     // Destructor to clean up allocated memory
     ~ImageBackingStore();
@@ -51,20 +51,22 @@ public:
         for (uint32_t group = 0; group < m_cow_group_count; ++group)
         {
             uint64_t pos = group * group_size_bytes;
+            uint64_t bytes_to_copy = std::min(static_cast<uint64_t>(group_size_bytes),
+                                              m_fsfile_orig.size() - pos);
 
             // std::cout << std::format("Group {} at pos {} is {}\n", group, pos, (getGroupImageType(group) == IMG_TYPE_DIRTY) ? "DIRTY" : "ORIG");
 
             if (getGroupImageType(group) == IMG_TYPE_DIRTY)
             {
                 std::copy(m_fsfile_dirty.data().data() + pos,
-                          m_fsfile_dirty.data().data() + pos + group_size_bytes,
+                          m_fsfile_dirty.data().data() + pos + bytes_to_copy,
                           data.data() + pos);
             }
             else
             {
                 // std::cout << std::format("  Copying ORIG data from overlay at pos {} size {}\n", pos, group_size_bytes);
                 std::copy(m_fsfile_orig.data().data() + pos,
-                          m_fsfile_orig.data().data() + pos + group_size_bytes,
+                          m_fsfile_orig.data().data() + pos + bytes_to_copy,
                           data.data() + pos);
             }
         }
@@ -78,6 +80,15 @@ public:
     // Statistics
     void dumpstats() const;
     std::string stats() const;
+    void resetStats()
+    {
+        m_bytes_read_original = 0;
+        m_bytes_read_dirty = 0;
+        m_bytes_written_dirty = 0;
+        m_bytes_requested_read = 0;
+        m_bytes_requested_write = 0;
+        m_bytes_read_original_cow = 0;
+    }
 
 protected:
     ssize_t cow_read_single(uint32_t from, uint32_t count, void *buf);
