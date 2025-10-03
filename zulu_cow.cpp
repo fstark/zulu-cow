@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <fcntl.h>
 #include <unistd.h>
+#include <stdexcept>
 
 // Initializes copy-on-write store: bitmap_size (dirty tracking), buffer_size (I/O chunks), scsi_block_size (sector size)
 ImageBackingStore::ImageBackingStore(const char *orig_filename, const char *dirty_filename,
@@ -24,7 +25,11 @@ ImageBackingStore::ImageBackingStore(const char *orig_filename, const char *dirt
     // Create overlay file at the same size as original (sparse)
     m_fsfile_dirty.seek(image_size_bytes - 1);
     uint8_t zero = 0;
-    m_fsfile_dirty.write(&zero, 1); // Create sparse file of correct size
+    ssize_t written = m_fsfile_dirty.write(&zero, 1); // Create sparse file of correct size
+    if (written != 1)
+    {
+        throw std::runtime_error("Failed to initialize dirty file: write operation failed");
+    }
 
     // Calculate optimal group size based on provided bitmap size
     // We have bitmap_size * 8 bits available in our bitmap
@@ -215,7 +220,7 @@ ssize_t ImageBackingStore::cow_read(void *buf, size_t count)
 //  Helper function for cow_write
 //  Copies original data to overlay (dirty) file for a specific byte range
 //  Request never spans multiple groups
-void ImageBackingStore::performCopyOnWrite(uint32_t from_offset, uint32_t to_offset)
+ssize_t ImageBackingStore::performCopyOnWrite(uint32_t from_offset, uint32_t to_offset)
 {
     // Verify both offsets are in the same group
     assert(groupFromOffset(from_offset) == groupFromOffset(to_offset - 1));
@@ -230,14 +235,32 @@ void ImageBackingStore::performCopyOnWrite(uint32_t from_offset, uint32_t to_off
     {
         uint32_t chunk_size = std::min(m_buffer_size, bytes_to_copy - bytes_copied);
 
-        m_fsfile_orig.read(m_buffer, chunk_size);
+        ssize_t bytes_read = m_fsfile_orig.read(m_buffer, chunk_size);
+        if (bytes_read < 0)
+        {
+            return bytes_read; // Return read error immediately
+        }
+        if (static_cast<uint32_t>(bytes_read) != chunk_size)
+        {
+            return -1; // Unexpected partial read
+        }
         m_bytes_read_original_cow += chunk_size;
 
-        m_fsfile_dirty.write(m_buffer, chunk_size);
+        ssize_t bytes_written = m_fsfile_dirty.write(m_buffer, chunk_size);
+        if (bytes_written < 0)
+        {
+            return bytes_written; // Return write error immediately
+        }
+        if (static_cast<uint32_t>(bytes_written) != chunk_size)
+        {
+            return -1; // Unexpected partial write
+        }
         m_bytes_written_dirty += chunk_size;
 
         bytes_copied += chunk_size;
     }
+
+    return bytes_to_copy; // Return total bytes copied
 }
 
 /*
@@ -271,7 +294,11 @@ ssize_t ImageBackingStore::cow_write(uint32_t from, uint32_t to, const void *buf
         if (from > group_start)
         {
             // Need to preserve data before the write
-            performCopyOnWrite(group_start, from);
+            ssize_t cow_result = performCopyOnWrite(group_start, from);
+            if (cow_result < 0)
+            {
+                return cow_result; // Return COW error immediately
+            }
         }
     }
 
@@ -292,7 +319,11 @@ ssize_t ImageBackingStore::cow_write(uint32_t from, uint32_t to, const void *buf
         if (to < group_end)
         {
             // Need to preserve data after the write
-            performCopyOnWrite(to, group_end);
+            ssize_t cow_result = performCopyOnWrite(to, group_end);
+            if (cow_result < 0)
+            {
+                return cow_result; // Return COW error immediately
+            }
         }
     }
 

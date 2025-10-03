@@ -110,7 +110,7 @@ protected:
     uint32_t offsetFromGroup(uint32_t group) { return group * m_cow_group_size * m_scsi_block_size; }
 
     // Helper methods
-    void performCopyOnWrite(uint32_t from_offset, uint32_t to_offset);
+    ssize_t performCopyOnWrite(uint32_t from_offset, uint32_t to_offset);
     uint64_t position() const { return m_current_position; }
 
     uint64_t m_current_position = 0; // Track current file position
