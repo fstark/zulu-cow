@@ -336,7 +336,7 @@ ssize_t ImageBackingStore::cow_write(uint32_t from, uint32_t to, const void *buf
     return bytes_written;
 }
 
-// Wrapper for cow_write that uses current file position and updates it
+// Public wrapper for cow_write (that uses current file position and updates it)
 ssize_t ImageBackingStore::cow_write(const void *buf, size_t count)
 {
     m_bytes_requested_write += count;
@@ -346,7 +346,7 @@ ssize_t ImageBackingStore::cow_write(const void *buf, size_t count)
 
     ssize_t bytes_written = cow_write(from, to, buf);
 
-    // Update current position
+    // Update current position (unsure if needed)
     if (bytes_written > 0)
     {
         set_position(m_current_position + bytes_written);
